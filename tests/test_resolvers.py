@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import namedtuple
+from collections import OrderedDict, namedtuple
 from typing import TYPE_CHECKING, Any, Iterator, Sequence, Tuple
 
 import pytest
@@ -18,6 +18,9 @@ from resolvelib.resolvers import (
     Resolution,
     Resolver,
 )
+from resolvelib.resolvers.criterion import Criterion
+from resolvelib.resolvers.resolution import _build_result
+from resolvelib.structs import RequirementInformation, State
 
 if TYPE_CHECKING:
     from typing import Iterable, Mapping
@@ -268,3 +271,84 @@ def test_pin_conflict_with_self(monkeypatch, reporter):
     assert result.mapping["parent"][1] == Version("1")
     assert result.mapping["child"][1] == Version("1")
     assert result.mapping["grandchild"][1] == Version("1")
+
+
+def test_circular_dependency_resolution():
+    """Resolver handles circular dependencies without crashing in _build_result."""
+    Candidate = namedtuple(
+        "Candidate", ["name", "version", "requirements"]
+    )  # name, version, requirements
+    _Requirement = namedtuple("Requirement", ["name", "versions"])  # name, versions
+    top = Candidate("top", 1, [_Requirement("a", {1})])
+    a = Candidate("a", 1, [_Requirement("b", {1})])
+    b = Candidate("b", 1, [_Requirement("a", {1})])
+    all_candidates = {
+        "top": [top],
+        "a": [a],
+        "b": [b],
+    }
+
+    class Provider(AbstractProvider):
+        def identify(self, requirement_or_candidate):
+            return requirement_or_candidate[0]
+
+        def get_preference(self, **_):
+            return 0
+
+        def get_dependencies(self, candidate):
+            return candidate.requirements
+
+        def find_matches(self, identifier, requirements, incompatibilities):
+            bad_versions = {c.version for c in incompatibilities[identifier]}
+            candidates = [
+                c
+                for c in all_candidates[identifier]
+                if all(c.version in r.versions for r in requirements[identifier])
+                and c.version not in bad_versions
+            ]
+            return sorted(candidates, key=lambda c: c.version, reverse=True)
+
+        def is_satisfied_by(self, requirement, candidate):
+            return candidate.version in requirement.versions
+
+    resolver = Resolver(Provider(), BaseReporter())
+    result = resolver.resolve([_Requirement("top", {1})])
+
+    assert set(result.mapping) == {"top", "a", "b"}
+    assert "a" in result.graph
+    assert "b" in result.graph
+
+
+def test_build_result_circular_parents_no_root_path():
+    """_build_result excludes cycle-only nodes without RecursionError.
+
+    This is the degenerate case that the resolver can produce when
+    _remove_information_from_criteria strips the non-cyclic parent info
+    from criteria during backtracking, leaving only circular parent
+    references with no path to root.
+    """
+    a_cand = ("a", "1")
+    b_cand = ("b", "1")
+
+    criteria = {
+        "a": Criterion(
+            candidates=[a_cand],
+            information=[RequirementInformation("a>=1", b_cand)],
+            incompatibilities=[],
+        ),
+        "b": Criterion(
+            candidates=[b_cand],
+            information=[RequirementInformation("b>=1", a_cand)],
+            incompatibilities=[],
+        ),
+    }
+
+    state = State(
+        mapping=OrderedDict({"a": a_cand, "b": b_cand}),
+        criteria=criteria,
+        backtrack_causes=[],
+    )
+
+    result = _build_result(state)
+    assert "a" not in result.mapping
+    assert "b" not in result.mapping

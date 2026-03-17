@@ -44,8 +44,9 @@ def _build_result(state: State[RT, CT, KT]) -> Result[RT, CT, KT]:
     graph.add(None)  # Sentinel as root dependencies' parent.
 
     connected: set[KT | None] = {None}
+    disconnected: set[KT | None] = set()
     for key, criterion in state.criteria.items():
-        if not _has_route_to_root(state.criteria, key, all_keys, connected):
+        if not _has_route_to_root(state.criteria, key, all_keys, connected, disconnected):
             continue
         if key not in graph:
             graph.add(key)
@@ -607,21 +608,25 @@ def _has_route_to_root(
     key: KT | None,
     all_keys: dict[int, KT | None],
     connected: set[KT | None],
+    disconnected: set[KT | None],
 ) -> bool:
     if key in connected:
         return True
+    if key in disconnected:
+        return False
     if key not in criteria:
         return False
     assert key is not None
+    # Assume disconnected until proven otherwise. This also breaks cycles:
+    # if we re-encounter this key during recursion, we return False above.
+    disconnected.add(key)
     for p in criteria[key].iter_parent():
         try:
             pkey = all_keys[id(p)]
         except KeyError:
             continue
-        if pkey in connected:
-            connected.add(key)
-            return True
-        if _has_route_to_root(criteria, pkey, all_keys, connected):
+        if _has_route_to_root(criteria, pkey, all_keys, connected, disconnected):
+            disconnected.discard(key)
             connected.add(key)
             return True
     return False
